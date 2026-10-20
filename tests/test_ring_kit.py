@@ -175,3 +175,50 @@ def test_exchange_code_posts_form():
     oauth = RingOAuth("cid", "s", token_url="https://oauth.test/t", http=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
     tokens = _run(oauth.exchange_code("c0de"))
     assert tokens.access_token == "a" and tokens.scope == "ava" and tokens.expiring(now=tokens.expires_at - 10)
+
+
+# Live view (RTSPS through FFmpeg) ------------------------------------------------------------------
+
+FAKE_FFMPEG = str(__import__("pathlib").Path(__file__).parent / "fakes" / "ffmpeg")
+
+
+def test_live_frame_passes_token_in_query_and_returns_jpeg(tmp_path, monkeypatch):
+    log = tmp_path / "args.log"
+    monkeypatch.setenv("FAKE_FFMPEG_MODE", "ok")
+    monkeypatch.setenv("FAKE_FFMPEG_LOG", str(log))
+    client = RingClient("tok-123", rtsp_base="rtsps://rtsp.test:322", ffmpeg=FAKE_FFMPEG)
+    media = _run(client.live_frame("dev1", component_id="2"))
+    assert media.content.startswith(b"\xff\xd8") and media.origin == "live" and media.content_type == "image/jpeg"
+    args = log.read_text().strip().split("\t")
+    assert args[args.index("-i") + 1] == "rtsps://rtsp.test:322/v1/devices/dev1/stream?token=tok-123&component_id=2"
+    assert args[args.index("-rtsp_transport") + 1] == "tcp" and args[args.index("-frames:v") + 1] == "1"
+
+
+def test_live_frame_errors_never_contain_the_token(monkeypatch):
+    monkeypatch.setenv("FAKE_FFMPEG_MODE", "401")
+    client = RingClient("very-secret-token", rtsp_base="rtsps://rtsp.test:322", ffmpeg=FAKE_FFMPEG)
+    with pytest.raises(RingAPIError) as err:
+        _run(client.live_frame("dev1"))
+    assert err.value.status == 401 and "very-secret-token" not in str(err.value) and "<token>" in str(err.value)
+
+
+def test_live_frame_refreshes_once_on_401(monkeypatch):
+    monkeypatch.setenv("FAKE_FFMPEG_MODE", "401")
+    refreshed = []
+
+    class Manager:
+        async def access_token(self, force_refresh=False):
+            refreshed.append(force_refresh)
+            return "t2" if force_refresh else "t1"
+
+    client = RingClient(Manager(), rtsp_base="rtsps://rtsp.test:322", ffmpeg=FAKE_FFMPEG)
+    with pytest.raises(RingAPIError):
+        _run(client.live_frame("dev1"))
+    assert refreshed == [False, True]
+
+
+def test_live_frame_without_ffmpeg():
+    client = RingClient("t", ffmpeg="/nonexistent/ffmpeg")
+    with pytest.raises(RingAPIError) as err:
+        _run(client.live_frame("dev1"))
+    assert "FFmpeg" in str(err.value)

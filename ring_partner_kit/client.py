@@ -7,6 +7,7 @@ server-to-server: the API blocks browser requests with CORS.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ import httpx
 
 API_BASE = "https://api.amazonvision.com"
 OAUTH_TOKEN_URL = "https://oauth.ring.com/oauth/token"
+RTSP_BASE = "rtsps://video.rtsp.amazonvision.com:322"
 
 # Refresh this long before the access token expires (tokens live about 4 hours).
 REFRESH_MARGIN_SECONDS = 300
@@ -113,11 +115,14 @@ class RingClient:
     """Thin typed wrapper over the Ring Partner API for one linked Ring account."""
 
     def __init__(self, token: TokenManager | str, *, base_url: str = API_BASE,
-                 http: httpx.AsyncClient | None = None, max_retries: int = 3):
+                 http: httpx.AsyncClient | None = None, max_retries: int = 3,
+                 rtsp_base: str = RTSP_BASE, ffmpeg: str = "ffmpeg"):
         self._token = token
         self.base_url = base_url.rstrip("/")
         self._http = http or httpx.AsyncClient(timeout=30)
         self.max_retries = max_retries
+        self.rtsp_base = rtsp_base.rstrip("/")
+        self.ffmpeg = ffmpeg
 
     async def _bearer(self, force_refresh: bool = False) -> str:
         if isinstance(self._token, str):
@@ -228,6 +233,43 @@ class RingClient:
             body["components"] = [{"component_id": str(component_id)}]
         return await self._download(f"/v1/devices/{device_id}/media/video/download", body)
 
+    async def live_frame(self, device_id: str, *, component_id: str | None = None,
+                         timeout: float = 25.0) -> Media:
+        """Grab one frame of what the camera sees right now, through Ring's RTSPS live-view bridge.
+
+        The media endpoints only serve frames from existing recordings (416 when there are none); live view
+        works whenever the camera is online. Needs FFmpeg with TLS support on the PATH. FFmpeg can't send the
+        token in a header, so it goes in the ``token`` query parameter, as Ring's docs advise; it is never
+        logged and is removed from error messages.
+        """
+        for attempt in (0, 1):
+            token = await self._bearer(force_refresh=attempt == 1)
+            query = f"token={token}" + (f"&component_id={component_id}" if component_id is not None else "")
+            url = f"{self.rtsp_base}/v1/devices/{device_id}/stream?{query}"
+            args = [self.ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-rtsp_transport", "tcp",
+                    "-timeout", str(int(timeout * 1_000_000)), "-skip_frame", "nokey", "-i", url,
+                    "-frames:v", "1", "-f", "image2", "-c:v", "mjpeg", "-q:v", "3", "pipe:1"]
+            try:
+                proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE,
+                                                            stderr=asyncio.subprocess.PIPE)
+            except FileNotFoundError as exc:
+                raise RingAPIError(0, f"live view needs FFmpeg ({self.ffmpeg} not found)") from exc
+            try:
+                out, err = await asyncio.wait_for(proc.communicate(), timeout + 5)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                raise RingAPIError(504, f"live view gave no frame within {timeout:.0f} s")
+            message = err.decode("utf-8", "replace").replace(token, "<token>").strip()
+            if proc.returncode == 0 and out:
+                return Media(content=out, content_type="image/jpeg",
+                             media_timestamp_ms=int(time.time() * 1000), origin="live")
+            status = _rtsp_status(message)
+            if status == 401 and attempt == 0 and not isinstance(self._token, str):
+                continue  # the token may have just expired: refresh once and retry
+            raise RingAPIError(status, f"live view failed: {message[-300:] or f'ffmpeg exit {proc.returncode}'}")
+        raise RingAPIError(401, "live view failed: token rejected")
+
     async def play_chime(self, device_id: str, audio_ref: str) -> dict[str, Any]:
         """Play one of the app's chime audio slots (needs the Chime Controls scope)."""
         resp = await self._request("POST", f"/v1/devices/{device_id}/media/audio/playback",
@@ -236,6 +278,12 @@ class RingClient:
 
     async def aclose(self) -> None:
         await self._http.aclose()
+
+
+def _rtsp_status(ffmpeg_stderr: str) -> int:
+    """Pull the RTSP status (401, 403, 404, 461, 503…) out of FFmpeg's error output, 0 if there is none."""
+    m = re.search(r"\b(4\d\d|5\d\d)\b", ffmpeg_stderr)
+    return int(m.group(1)) if m else 0
 
 
 def _error_message(resp: httpx.Response) -> str:

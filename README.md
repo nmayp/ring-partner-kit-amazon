@@ -19,7 +19,7 @@ pip install ring-partner-kit          # or: pip install git+https://github.com/d
 |---|---|
 | `webhooks` | `verify_signature()` checks `X-Signature: sha256=<hex>` over the **raw** body in constant time; `parse_event()` flattens the v1.1 JSON:API envelope into a `RingEvent`; event-type constants including contact sensors |
 | `linking` | one-way (Ring-driven) account linking: `compute_nonce()` (URL-safe base64 HMAC, no padding), `check_freshness()` (10-minute window), `match_nonce()` over your unclaimed tokens, `mask_email()` for `account_identifier` |
-| `client` | `RingOAuth` (authorization-code exchange and refresh), `TokenManager` (refresh before expiry, persist rotated refresh tokens), `RingClient` (devices, status, event history, snapshots and clips via the 303 pre-signed download without leaking the bearer token, chime playback, app-integrations); retries 429/5xx with `Retry-After`, refreshes once on 401 |
+| `client` | `RingOAuth` (authorization-code exchange and refresh), `TokenManager` (refresh before expiry, persist rotated refresh tokens), `RingClient` (devices, status, event history, snapshots and clips via the 303 pre-signed download without leaking the bearer token, chime playback, app-integrations, and `live_frame()`, which grabs one keyframe from the RTSPS live-view bridge with FFmpeg); retries 429/5xx with `Retry-After`, refreshes once on 401 |
 | `simulator` | builds v1.1 payloads for any event type and signs them exactly as Ring does, as a library or a CLI |
 
 ## Examples
