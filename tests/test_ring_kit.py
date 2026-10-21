@@ -222,3 +222,64 @@ def test_live_frame_without_ffmpeg():
     with pytest.raises(RingAPIError) as err:
         _run(client.live_frame("dev1"))
     assert "FFmpeg" in str(err.value)
+
+
+# Live view (WHEP / WebRTC) ---------------------------------------------------------------------------
+
+def _fake_whep_ring(seen: dict, status: int = 201):
+    """A stand-in for Ring's WHEP endpoint: answers the SDP offer and streams real WebRTC video on localhost."""
+    from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
+
+    peers = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "DELETE":
+            seen["closed"] = str(request.url)
+            return httpx.Response(204)
+        seen["auth"] = request.headers["authorization"]
+        seen["type"] = request.headers["content-type"]
+        seen["url"] = str(request.url)
+        offer = request.content.decode()
+        seen["recvonly"] = "a=recvonly" in offer
+        if status != 201:
+            return httpx.Response(status, json={"errors": [{"detail": "device offline"}]})
+        pc = RTCPeerConnection()
+        peers.append(pc)
+        pc.addTrack(VideoStreamTrack())  # aiortc's test pattern: green frames
+        await pc.setRemoteDescription(RTCSessionDescription(sdp=offer, type="offer"))
+        await pc.setLocalDescription(await pc.createAnswer())
+        return httpx.Response(201, text=pc.localDescription.sdp, headers={
+            "content-type": "application/sdp",
+            "location": f"{request.url.scheme}://{request.url.host}{request.url.path}/sess-1"})
+
+    return handler, peers
+
+
+def test_whep_frame_returns_a_jpeg_and_closes_the_session():
+    pytest.importorskip("aiortc")
+    seen: dict = {}
+
+    async def go():
+        handler, peers = _fake_whep_ring(seen)
+        client = RingClient("tok-9", http=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+        try:
+            return await client.whep_frame("dev1", component_id="2", timeout=20, ice_servers=())
+        finally:
+            for pc in peers:
+                await pc.close()
+
+    media = _run(go())
+    assert media.content.startswith(b"\xff\xd8") and media.origin == "live" and media.content_type == "image/jpeg"
+    assert seen["auth"] == "Bearer tok-9" and seen["type"] == "application/sdp" and seen["recvonly"]
+    assert seen["url"].endswith("/v1/devices/dev1/media/streaming/whep/sessions?component_id=2")
+    assert seen["closed"].endswith("/whep/sessions/sess-1")
+
+
+def test_whep_frame_reports_a_refused_session():
+    pytest.importorskip("aiortc")
+    seen: dict = {}
+    handler, _ = _fake_whep_ring(seen, status=503)
+    client = RingClient("t", http=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    with pytest.raises(RingAPIError) as err:
+        _run(client.whep_frame("dev1", timeout=5, ice_servers=()))
+    assert err.value.status == 503 and "device offline" in str(err.value) and "closed" not in seen

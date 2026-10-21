@@ -270,6 +270,81 @@ class RingClient:
             raise RingAPIError(status, f"live view failed: {message[-300:] or f'ffmpeg exit {proc.returncode}'}")
         raise RingAPIError(401, "live view failed: token rejected")
 
+    async def whep_frame(self, device_id: str, *, component_id: str | None = None, timeout: float = 15.0,
+                         skip: int = 3, ice_servers: tuple[str, ...] = ("stun:stun.l.google.com:19302",)) -> Media:
+        """Grab one frame of what the camera sees right now, through Ring's WHEP (WebRTC) live view.
+
+        The session is set up over HTTPS (an SDP offer POSTed to the WHEP endpoint, 201 with the answer and a
+        Location to close it); the video then arrives over WebRTC. Use this where the RTSPS bridge's port 322 is
+        unreachable. Needs the optional ``aiortc`` package. ``skip`` decoded frames are dropped first, since a
+        stream can start on a half-drawn picture. The session is always closed, so it doesn't count against the
+        device's session limit (30 s on battery, 60 s on line power).
+        """
+        try:
+            import av
+            from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
+        except ImportError as exc:
+            raise RingAPIError(0, "WebRTC live view needs the aiortc package") from exc
+        pc = RTCPeerConnection(RTCConfiguration([RTCIceServer(url) for url in ice_servers]))
+        loop = asyncio.get_running_loop()
+        frame_ready: asyncio.Future = loop.create_future()
+
+        @pc.on("track")
+        def on_track(track):  # attached before the offer, as Ring's docs require
+            if track.kind != "video":
+                return
+
+            async def pump():
+                seen = 0
+                try:
+                    while not frame_ready.done():
+                        frame = await track.recv()
+                        seen += 1
+                        if seen > skip:
+                            frame_ready.set_result(frame)
+                except Exception as exc:  # the track ends when the session closes
+                    if not frame_ready.done():
+                        frame_ready.set_exception(RingAPIError(0, f"live view stream ended: {exc}"))
+            asyncio.ensure_future(pump())
+
+        session_url = None
+        try:
+            pc.addTransceiver("video", direction="recvonly")
+            await pc.setLocalDescription(await pc.createOffer())  # aiortc gathers every ICE candidate here
+            path = f"/v1/devices/{device_id}/media/streaming/whep/sessions"
+            params = {"component_id": str(component_id)} if component_id is not None else None
+            for attempt in (0, 1):
+                resp = await self._http.post(f"{self.base_url}{path}", params=params,
+                                             content=pc.localDescription.sdp.encode(),
+                                             headers={"Authorization": f"Bearer {await self._bearer(force_refresh=attempt == 1)}",
+                                                      "Content-Type": "application/sdp"})
+                if resp.status_code == 401 and attempt == 0 and not isinstance(self._token, str):
+                    continue
+                break
+            if resp.status_code != 201:
+                raise RingAPIError(resp.status_code, f"WHEP session refused: {_error_message(resp)}",
+                                   resp.headers.get("x-request-id"))
+            session_url = resp.headers.get("location")
+            await pc.setRemoteDescription(RTCSessionDescription(sdp=resp.text, type="answer"))
+            try:
+                frame = await asyncio.wait_for(frame_ready, timeout)
+            except asyncio.TimeoutError:
+                raise RingAPIError(504, f"WebRTC live view gave no frame within {timeout:.0f} s "
+                                        f"(connection {pc.connectionState})")
+            encoder = av.CodecContext.create("mjpeg", "w")
+            encoder.width, encoder.height, encoder.pix_fmt = frame.width, frame.height, "yuvj420p"
+            encoder.options = {"q:v": "3"}
+            packets = encoder.encode(frame.reformat(format="yuvj420p")) + encoder.encode(None)
+            return Media(content=b"".join(bytes(p) for p in packets), content_type="image/jpeg",
+                         media_timestamp_ms=int(time.time() * 1000), origin="live")
+        finally:
+            if session_url:
+                try:
+                    await self._http.delete(session_url, headers={"Authorization": f"Bearer {await self._bearer()}"})
+                except httpx.HTTPError:
+                    pass
+            await pc.close()
+
     async def play_chime(self, device_id: str, audio_ref: str) -> dict[str, Any]:
         """Play one of the app's chime audio slots (needs the Chime Controls scope)."""
         resp = await self._request("POST", f"/v1/devices/{device_id}/media/audio/playback",
