@@ -4,13 +4,13 @@ A small, typed Python toolkit for building on the **Ring Partner API** (Amazon V
 so every partner ends up writing the same pieces: verifying webhook signatures, matching account-linking nonces,
 refreshing tokens, following media redirects, and faking events for tests. This package does those, with tests.
 
-Extracted from [Porchlight](https://github.com/dfifth/hackathons/tree/main/porchlight), an accessible doorbell
+Extracted from [Porchlight](https://github.com/dfifth/porchlight-amazon), an accessible doorbell
 built for the Amazon Developer Hackathon 2026.
 
 ## Install
 
 ```bash
-pip install ring-partner-kit          # or: pip install git+https://github.com/dfifth/ring-partner-kit
+pip install ring-partner-kit          # or: pip install git+https://github.com/dfifth/ring-partner-kit-amazon
 ```
 
 ## What's inside
